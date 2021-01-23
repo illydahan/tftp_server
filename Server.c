@@ -10,7 +10,7 @@ const int NUMBER_OF_FAILURES = 7;
 int main(int argc, char *argv[]) 
 {
     if(argc < 2) {
-        fprintf(stderr, "Invalid usage..Please specift port number\n");
+        printf("Invalid usage..Please specift port number\n");
         exit(1);
     }
 
@@ -21,7 +21,7 @@ int main(int argc, char *argv[])
     // set up udp socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
-        fprintf(stderr, "ERROR opening socket\n");
+        perror("TTFTP_ERROR: Error creating UDP socket\n");
         exit(1);
     }
 
@@ -36,7 +36,7 @@ int main(int argc, char *argv[])
 
     // bind socket to the address
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        fprintf(stderr, "Error binding socket to server address.(Port in use ?)\n");
+        perror("TTFTP_ERROR: Error binding scoket to address\n");
         exit(1);
     }
 
@@ -65,13 +65,9 @@ int main(int argc, char *argv[])
         char *ack;
         int msg_recvlen, writelen;
         
-        //recvlen = recvfrom(sockfd, &op_code, 2, MSG_WAITALL,(struct sockaddr *)&cli_addr, (unsigned int *)&client_len);
         uint32_t block_number = 0;
-        int timeout_counter = 0;
-
-        
-
-
+        int fault_counter = 0;
+        int success = 0;
 
         while(is_active) 
         {
@@ -88,10 +84,30 @@ int main(int argc, char *argv[])
             }
             else if(ret == 0) {
                 // timeout
-                printf("Time out\n");
-                ++timeout_counter;
-                if (timeout_counter >= WAIT_FOR_PACKET_TIMEOUT)
-                    break;
+                
+                if (in_file != NULL) {
+                    ++fault_counter;
+                    
+                    ack = make_ACK_packet(block_number);
+                    writelen = 0;
+                    while (writelen <= 0)
+                    {
+                        writelen = sendto(sockfd, (const void *)ack, sizeof(struct ACK), 0, (struct sockaddr *)&cli_addr, client_len);
+                        printf("OUT:ACK,%d\n", block_number);
+                    }
+                    free(ack);
+
+
+                    printf("FLOWERROR: Didn't recieved any message in 3 seconds\n");
+                    if (fault_counter >= NUMBER_OF_FAILURES) {
+                        printf("FLOWERROR: Failured count exceeded the session limit (7)..Bailling out.\n");
+                        fclose(in_file);
+                        in_file = NULL;
+                        break;
+                    }
+                }
+                
+                    
             }
             else {
                 // recieve the opcode
@@ -103,19 +119,20 @@ int main(int argc, char *argv[])
                 }
 
             }
-            //recvlen = recvfrom(sockfd, &op_code, 2, MSG_WAITALL,(struct sockaddr *)&cli_addr, (unsigned int *)&client_len);
             if(msg_recvlen > 0) 
             {
                 int parsed_opcode = recv_buf[1];
                 switch (parsed_opcode)
                 {
                 case OP_WRQ:
-                    printf("got WRQ..\n");
                     // TODO: validate first and only wrq of the session.
 
                     wrq_packet = parse_WRQ_packet(recv_buf);
+                    printf("IN:WRQ,%s,%s\n", wrq_packet->file_name, wrq_packet->trans_mode);
                     in_file = fopen(wrq_packet->file_name, "w");
-                    printf("file name %s\n", wrq_packet->file_name);
+                    if (!in_file) {
+                        perror("TTFTP_ERROR: Cannot open/create new file\n");
+                    }
                     free(wrq_packet);
 
                     ack = make_ACK_packet(block_number);
@@ -123,7 +140,7 @@ int main(int argc, char *argv[])
                     while (writelen <= 0)
                     {
                         writelen = sendto(sockfd, (const void *)ack, sizeof(struct ACK), 0, (struct sockaddr *)&cli_addr, client_len);
-                        printf("error, %s\n", strerror(errno));
+                        printf("OUT:ACK,%d\n", block_number);
                     }
                     
                     free(ack);
@@ -136,22 +153,33 @@ int main(int argc, char *argv[])
                 case OP_DATA:
                     if(!in_file) {
                         // error. cant get data before write request
-                        printf("error. cant get data before write request\n");
-                        fclose(in_file);
+                        printf("FLOWERROR: cant get data before write request\n");
                         exit(1);
 
                     }
-                    printf("got data request\n");
                     // TODO: validate first and only wrq of the session.
                                         
                     //recvlen = recvfrom(sockfd, (char *)recv_buf, BUF_SIZE - 2, MSG_WAITALL,(struct sockaddr *)&cli_addr, &client_len);
                     if(msg_recvlen < BUF_SIZE) {
                         // last data packet recieved, send ack and end session.
-                        printf("DEBUG:: last packet..\n");
+                        success = 1;
                         is_active = 0;
                     }
                     data_packet = parse_DATA_packet(recv_buf, msg_recvlen - 4);
-                    fwrite(data_packet->data_buffer, sizeof(char), msg_recvlen - 4, in_file);
+                    printf("IN:DATA, %d,%d\n", block_number, msg_recvlen);
+                    int recv_block_num = ((int)data_packet->block_number[1] & 0xff) | (((int)data_packet->block_number[0] & 0xff) << 8);
+                    if (recv_block_num != block_number) {
+                        printf("FLOWERROR: The recieved block number is invalid..Bailling out.\n");
+            
+                        success = 0;
+                        break;
+                    }
+                    printf("WRITING: %d\n", msg_recvlen - 4);
+                    int written = fwrite(data_packet->data_buffer, sizeof(char), msg_recvlen - 4, in_file);
+                    if (written != msg_recvlen - 4) {
+                        perror("TTFTP_ERROR: Unable to write the requested amount of bytes to file\n");
+                    }
+                    
                     free(data_packet);
 
                     ack = make_ACK_packet(block_number);
@@ -159,6 +187,7 @@ int main(int argc, char *argv[])
                     while (writelen <= 0)
                     {
                         writelen = sendto(sockfd, (const void *)ack, sizeof(struct ACK), 0, (struct sockaddr *)&cli_addr, client_len);
+                        printf("OUT:ACK,%d\n", block_number);
                     }
                     free(ack);
 
@@ -174,6 +203,12 @@ int main(int argc, char *argv[])
             msg_recvlen = 0;
             writelen++;
         }    
+        if (success) {
+            printf("RECVOK\n");
+        }
+        else {
+            printf("RECVFAIL\n");
+        }
         if(in_file)
             fclose(in_file);
     }

@@ -83,6 +83,5 @@ char * get_string_size(char *in_buffer, int *string_length)
     // re-wind the in_buffer
     
     memcpy(out_buffer, in_buffer , *string_length);
-    printf("file name %s\n ", out_buffer);
     return out_buffer;
 }
